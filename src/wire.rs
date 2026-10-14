@@ -1,9 +1,13 @@
 use anyhow::{bail, Result};
 
+#[allow(dead_code)]
 pub const HEADER_LEN: usize = 13; // 1 (type) + 4 (session_id) + 8 (counter)
+#[allow(dead_code)]
 pub const TAG_LEN: usize = 16;    // Poly1305 MAC tag
+#[allow(dead_code)]
 pub const OVERHEAD: usize = HEADER_LEN + TAG_LEN; // 29 bytes
 
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -30,6 +34,7 @@ impl TryFrom<u8> for MessageType {
 }
 
 /// Header for encapsulated data datagrams.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataHeader {
     pub msg_type: MessageType,
@@ -37,6 +42,7 @@ pub struct DataHeader {
     pub counter: u64,
 }
 
+#[allow(dead_code)]
 impl DataHeader {
     pub fn new(session_id: u32, counter: u64) -> Self {
         Self {
@@ -74,12 +80,14 @@ impl DataHeader {
 }
 
 /// 128-bit Anti-Replay Sliding Window.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct AntiReplayFilter {
     max_counter: u64,
     bitmap: u128,
 }
 
+#[allow(dead_code)]
 impl AntiReplayFilter {
     pub const WINDOW_SIZE: u64 = 128;
 
@@ -123,5 +131,50 @@ impl AntiReplayFilter {
             self.bitmap |= bit;
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_header_roundtrip() {
+        let original = DataHeader::new(0xDEADBEEF, 42);
+        let bytes = original.serialize();
+        let parsed = DataHeader::deserialize(&bytes).expect("Should deserialize");
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_replay_window_in_order() {
+        let mut filter = AntiReplayFilter::new();
+        assert!(filter.check_and_update(1));
+        assert!(filter.check_and_update(2));
+        assert!(filter.check_and_update(3));
+        // Duplicates rejected
+        assert!(!filter.check_and_update(2));
+        assert!(!filter.check_and_update(3));
+    }
+
+    #[test]
+    fn test_replay_window_out_of_order() {
+        let mut filter = AntiReplayFilter::new();
+        assert!(filter.check_and_update(10));
+        assert!(filter.check_and_update(5));
+        assert!(filter.check_and_update(8));
+        // Repeat rejected
+        assert!(!filter.check_and_update(5));
+        assert!(!filter.check_and_update(10));
+    }
+
+    #[test]
+    fn test_replay_window_old_dropped() {
+        let mut filter = AntiReplayFilter::new();
+        assert!(filter.check_and_update(200));
+        // Counter < 200 - 128 = 72 should be dropped
+        assert!(!filter.check_and_update(70));
+        // Counter within window accepted
+        assert!(filter.check_and_update(150));
     }
 }

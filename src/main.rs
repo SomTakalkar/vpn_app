@@ -1,6 +1,3 @@
-mod packet;
-mod wire;
-
 use std::net::Ipv4Addr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -8,7 +5,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "vpn_app")]
+#[command(name = "vpn")]
 #[command(author = "Som Takalkar")]
 #[command(version = "0.1.0")]
 #[command(about = "Custom Layer 3/4 Encrypted VPN Daemon in Rust", long_about = None)]
@@ -69,11 +66,11 @@ async fn main() -> Result<()> {
         }
         Commands::Client { server, tun_ip } => {
             info!("Starting VPN Client connecting to {} with TUN IP {}...", server, tun_ip);
-            // Will be hooked into Phase 2 / 3
+            // Hooked into Phase 2 / 3
         }
         Commands::Server { bind, tun_ip } => {
             info!("Starting VPN Server listening on {} with TUN IP {}...", bind, tun_ip);
-            // Will be hooked into Phase 2 / 3
+            // Hooked into Phase 2 / 3
         }
     }
 
@@ -116,7 +113,7 @@ async fn run_tun_playground(name: String, ip: Ipv4Addr, netmask: Ipv4Addr, mtu: 
         let n = dev.read(&mut buf).await.context("Failed reading from TUN device")?;
         packet_count += 1;
 
-        if let Some(header) = packet::Ipv4PacketHeader::parse(&buf[..n]) {
+        if let Some(header) = vpn::packet::Ipv4PacketHeader::parse(&buf[..n]) {
             info!(
                 "[#{} | {} bytes] {} -> {} | Proto: {} | TTL: {}",
                 packet_count,

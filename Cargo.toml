@@ -1,28 +1,21 @@
 [package]
-name = "vpn_app"
+name = "vpn"
 version = "0.1.0"
 edition = "2021"
 authors = ["Som Takalkar"]
-description = "A custom Layer 3/4 encrypted VPN daemon in Rust using TUN interfaces and ChaCha20-Poly1305"
+description = "Custom Layer 3/4 encrypted VPN daemon in Rust"
 
 [dependencies]
-# Async Runtime & Networking
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+# Pinned to 0.6: the async API changed in later releases.
 tun = { version = "0.6", features = ["async"] }
-bytes = "1.6"
-
-# Cryptography & Key Exchange
-chacha20poly1305 = "0.10"
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-hkdf = "0.12"
-sha2 = "0.10"
-rand = "0.8"
-
-# CLI & Configuration
-clap = { version = "4.5", features = ["derive"] }
-
-# Logging & Error Handling
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
-thiserror = "1.0"
+
+# Phase 3 & 4 (encryption + handshake + replay protection)
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"

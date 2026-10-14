@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpProtocol {
     Icmp,
@@ -31,7 +32,8 @@ impl std::fmt::Display for IpProtocol {
 }
 
 /// Parsed IPv4 packet header info.
-#[derive(Debug, Clone)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ipv4PacketHeader {
     pub version: u8,
     pub ihl_bytes: usize,
@@ -76,5 +78,47 @@ impl Ipv4PacketHeader {
             src_ip,
             dst_ip,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_echo_request() -> Vec<u8> {
+        let mut p = vec![0u8; 84];
+        p[0] = 0x45; // version 4, IHL 5 (20 bytes)
+        p[2..4].copy_from_slice(&84u16.to_be_bytes());
+        p[8] = 64;   // TTL
+        p[9] = 1;    // ICMP
+        p[12..16].copy_from_slice(&[10, 8, 0, 2]);
+        p[16..20].copy_from_slice(&[10, 8, 0, 3]);
+        p[20] = 8;   // ICMP echo request
+        p
+    }
+
+    #[test]
+    fn test_parse_ipv4_valid() {
+        let pkt = sample_echo_request();
+        let header = Ipv4PacketHeader::parse(&pkt).expect("Should parse valid IPv4 packet");
+        assert_eq!(header.version, 4);
+        assert_eq!(header.ihl_bytes, 20);
+        assert_eq!(header.total_length, 84);
+        assert_eq!(header.ttl, 64);
+        assert_eq!(header.protocol, IpProtocol::Icmp);
+        assert_eq!(header.src_ip, Ipv4Addr::new(10, 8, 0, 2));
+        assert_eq!(header.dst_ip, Ipv4Addr::new(10, 8, 0, 3));
+    }
+
+    #[test]
+    fn test_parse_ipv4_truncated() {
+        assert!(Ipv4PacketHeader::parse(&[0x45; 10]).is_none());
+    }
+
+    #[test]
+    fn test_parse_non_ipv4() {
+        let mut pkt = sample_echo_request();
+        pkt[0] = 0x60; // IPv6
+        assert!(Ipv4PacketHeader::parse(&pkt).is_none());
     }
 }
