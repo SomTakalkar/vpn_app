@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.bk
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+*.pem
+*.key
+
+# Testbed logs & temporary captures
+*.pcap
+*.log
