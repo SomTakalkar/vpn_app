@@ -80,6 +80,7 @@ fn hkdf_derive<const N: usize>(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; N] 
 pub struct ClientHandshakeInitiated {
     client_ephemeral: StaticSecret,
     client_static: StaticSecret,
+    #[allow(dead_code)]
     server_static_pub: PublicKey,
     dh1: [u8; 32],
     dh2: [u8; 32],

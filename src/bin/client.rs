@@ -1,19 +1,20 @@
-//! Phase 4 – VPN Client: Authenticated Noise IK Handshake + Anti-Replay + Keepalives
+//! Phase 4/5 – VPN Client: Authenticated Noise IK Handshake + Full-Tunnel Routing
 //!
 //! Features:
 //!   - Initiates Noise IK handshake with Perfect Forward Secrecy.
-//!   - Authenticates against pinned server public key.
 //!   - Directional keys (K_c→s for send, K_s→c for receive).
 //!   - 128-bit AntiReplayFilter executed ONLY AFTER successful Poly1305 decryption.
-//!   - Resilient TUN writes (daemon never panics/aborts on transient write error).
+//!   - RAII RouteGuard automating 0.0.0.0/1 and 128.0.0.0/1 full-tunnel overrides.
+//!   - Host route protection (10.0.2.2/32 via underlay gateway) preventing routing loops.
 //!   - Non-blocking handshake drain (ignores stray datagrams during response wait).
 //!   - Periodic Keepalive (0x04) heartbeats every 20s to sustain NAT mappings.
 //!   - Rekeying triggers on packet counter or elapsed time.
 //!
 //! Run inside the client namespace:
-//!   sudo ip netns exec ns-client ./target/debug/client --server 10.0.2.2:51820
+//!   sudo ip netns exec ns-client ./target/debug/client --server 10.0.2.2:51820 --full-tunnel
 
 use std::net::Ipv4Addr;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -36,7 +37,7 @@ use vpn::wire::{
 };
 
 #[derive(Parser, Debug)]
-#[command(about = "Phase 4: VPN Client with Noise IK Handshake & Anti-Replay")]
+#[command(about = "Phase 4/5: VPN Client with Noise IK Handshake & Full Tunnel")]
 struct Args {
     #[arg(long)]
     server: String,
@@ -52,6 +53,16 @@ struct Args {
 
     #[arg(long, default_value_t = 1400)]
     mtu: u16,
+
+    /// Enable full-tunnel routing (0.0.0.0/1 & 128.0.0.0/1)
+    #[arg(long, default_value_t = false)]
+    full_tunnel: bool,
+
+    #[arg(long, default_value = "10.0.1.1")]
+    gateway: Ipv4Addr,
+
+    #[arg(long, default_value = "veth-c")]
+    egress_dev: String,
 }
 
 struct ClientSession {
@@ -62,6 +73,88 @@ struct ClientSession {
     replay_filter: AntiReplayFilter,
     last_sent: Instant,
     last_handshake: Instant,
+}
+
+/// RAII Guard that manages full-tunnel routing table overrides
+struct RouteGuard {
+    server_ip: Ipv4Addr,
+    gateway_ip: Ipv4Addr,
+    veth_dev: String,
+    tun_name: String,
+    active: bool,
+}
+
+impl RouteGuard {
+    pub fn setup(
+        server_ip: Ipv4Addr,
+        gateway_ip: Ipv4Addr,
+        veth_dev: &str,
+        tun_name: &str,
+    ) -> Result<Self> {
+        info!("Applying Phase 5 Full-Tunnel Routes...");
+
+        // 1. Direct host route to server via original underlay gateway
+        run_ip_route(&[
+            "add",
+            &format!("{}/32", server_ip),
+            "via",
+            &gateway_ip.to_string(),
+            "dev",
+            veth_dev,
+        ])?;
+
+        // 2. Pair of /1 routes covering entire IPv4 space without touching default /0
+        run_ip_route(&["add", "0.0.0.0/1", "dev", tun_name])?;
+        run_ip_route(&["add", "128.0.0.0/1", "dev", tun_name])?;
+
+        info!("Full-tunnel routes active: 0.0.0.0/1 and 128.0.0.0/1 -> {}", tun_name);
+
+        Ok(Self {
+            server_ip,
+            gateway_ip,
+            veth_dev: veth_dev.to_string(),
+            tun_name: tun_name.to_string(),
+            active: true,
+        })
+    }
+
+    pub fn teardown(&mut self) {
+        if !self.active {
+            return;
+        }
+        info!("Restoring original routing table...");
+        let _ = run_ip_route(&["del", "0.0.0.0/1", "dev", &self.tun_name]);
+        let _ = run_ip_route(&["del", "128.0.0.0/1", "dev", &self.tun_name]);
+        let _ = run_ip_route(&[
+            "del",
+            &format!("{}/32", self.server_ip),
+            "via",
+            &self.gateway_ip.to_string(),
+            "dev",
+            &self.veth_dev,
+        ]);
+        self.active = false;
+        info!("Routing table restored.");
+    }
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+fn run_ip_route(args: &[&str]) -> Result<()> {
+    let status = Command::new("ip")
+        .arg("route")
+        .args(args)
+        .status()
+        .with_context(|| format!("Failed to execute 'ip route {:?}'", args))?;
+
+    if !status.success() {
+        bail!("ip route {:?} returned non-zero exit code: {:?}", args, status);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -115,6 +208,17 @@ async fn main() -> Result<()> {
 
     // ── Initial Handshake ──────────────────────────────────────────
     let mut session = perform_handshake(&udp, &client_static, &server_public).await?;
+
+    // Phase 5: Activate full-tunnel routes if requested
+    let mut _route_guard = if args.full_tunnel {
+        let server_ip = match server_addr {
+            std::net::SocketAddr::V4(v4) => *v4.ip(),
+            _ => bail!("IPv6 server address not supported yet"),
+        };
+        Some(RouteGuard::setup(server_ip, args.gateway, &args.egress_dev, &args.tun_name)?)
+    } else {
+        None
+    };
 
     let mut tun_buf = vec![0u8; 65535];
     let mut udp_buf = vec![0u8; 65535];

@@ -1,23 +1,25 @@
-//! Phase 4 – VPN Server: Authenticated Noise IK Handshake + Anti-Replay + Session Table
+//! Phase 4/5 – VPN Server: Authenticated Noise IK Handshake + Server-Side NAT (MASQUERADE)
 //!
 //! Features:
 //!   - Ephemeral-static ECDH (Noise IK) key exchange with Perfect Forward Secrecy.
 //!   - Per-peer handshake replay protection using monotonic UTC timestamps.
 //!   - Per-session table keyed by session_id with directional keys (K_c→s and K_s→c).
 //!   - 128-bit AntiReplayFilter checked ONLY AFTER successful Poly1305 decryption.
+//!   - RAII NatGuard enabling net.ipv4.ip_forward=1 and iptables MASQUERADE on egress.
 //!   - Resilient TUN writes (daemon never panics/aborts on transient write error).
 //!   - Zero-copy IPv4 packet parsing for safe routing.
 //!   - Periodic stale session GC (purges sessions inactive > 1 hour).
 //!   - Support for Data (0x03) and Keepalive (0x04) message types.
 //!
 //! Run inside the server namespace:
-//!   sudo ip netns exec ns-server ./target/debug/server
+//!   sudo ip netns exec ns-server ./target/debug/server --nat --egress-iface veth-s
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -39,6 +41,7 @@ struct PeerConfig {
     last_timestamp: Option<Timestamp>,
 }
 
+#[allow(dead_code)]
 struct ActiveSession {
     session_id: u32,
     peer_pub: [u8; 32],
@@ -52,8 +55,77 @@ struct ActiveSession {
     last_activity: Instant,
 }
 
+struct NatGuard {
+    subnet: String,
+    egress_iface: String,
+    active: bool,
+}
+
+impl NatGuard {
+    pub fn setup(subnet: &str, egress_iface: &str) -> Result<Self> {
+        info!("Enabling Server IP forwarding & NAT (MASQUERADE)...");
+
+        // 1. Enable sysctl net.ipv4.ip_forward
+        let status = Command::new("sysctl")
+            .args(["-w", "net.ipv4.ip_forward=1"])
+            .status()
+            .context("Failed enabling net.ipv4.ip_forward")?;
+        if !status.success() {
+            bail!("Failed setting net.ipv4.ip_forward=1");
+        }
+
+        // 2. Add iptables MASQUERADE rule
+        let iptables_status = Command::new("iptables")
+            .args([
+                "-t", "nat",
+                "-A", "POSTROUTING",
+                "-s", subnet,
+                "-o", egress_iface,
+                "-j", "MASQUERADE",
+            ])
+            .status()
+            .context("Failed executing iptables MASQUERADE command")?;
+
+        if !iptables_status.success() {
+            bail!("iptables returned non-zero exit code while adding NAT rule");
+        }
+
+        info!("NAT MASQUERADE active: {} -> {}", subnet, egress_iface);
+
+        Ok(Self {
+            subnet: subnet.to_string(),
+            egress_iface: egress_iface.to_string(),
+            active: true,
+        })
+    }
+
+    pub fn teardown(&mut self) {
+        if !self.active {
+            return;
+        }
+        info!("Cleaning up iptables NAT rule...");
+        let _ = Command::new("iptables")
+            .args([
+                "-t", "nat",
+                "-D", "POSTROUTING",
+                "-s", &self.subnet,
+                "-o", &self.egress_iface,
+                "-j", "MASQUERADE",
+            ])
+            .status();
+        self.active = false;
+        info!("NAT rule removed.");
+    }
+}
+
+impl Drop for NatGuard {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
 #[derive(Parser, Debug)]
-#[command(about = "Phase 4: VPN Server with Noise IK Handshake & Anti-Replay")]
+#[command(about = "Phase 4/5: VPN Server with Noise IK Handshake & NAT")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:51820")]
     bind: String,
@@ -69,6 +141,12 @@ struct Args {
 
     #[arg(long, default_value_t = 1400)]
     mtu: u16,
+
+    #[arg(long, default_value = "veth-s")]
+    egress_iface: String,
+
+    #[arg(long, default_value_t = true)]
+    nat: bool,
 }
 
 #[tokio::main]
@@ -113,6 +191,13 @@ async fn main() -> Result<()> {
     let mut tun_dev = tun::create_as_async(&tun_config)
         .context("Failed to create TUN device (need root / CAP_NET_ADMIN)")?;
     info!("TUN '{}' is up: {}/{} mtu={}", args.tun_name, args.tun_addr, args.netmask, args.mtu);
+
+    // ── Phase 5: Setup NAT Masquerade on Egress Interface ──────────
+    let mut _nat_guard = if args.nat {
+        Some(NatGuard::setup("10.8.0.0/24", &args.egress_iface)?)
+    } else {
+        None
+    };
 
     // ── Bind UDP socket ────────────────────────────────────────────
     let udp = UdpSocket::bind(&args.bind)

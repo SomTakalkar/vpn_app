@@ -124,7 +124,40 @@ sudo ip netns exec ns-router tcpdump -i veth-rc -X udp port 51820 -c 10
 - Data (`0x03`): Completely encrypted with directional keys; headers authenticated as AAD.
 - Keepalive (`0x04`): Emitted every 20s if no ping traffic is flowing.
 
-### 4. Tear Down
+### 4. Phase 5 — Full-Tunnel Routing & Server NAT (MASQUERADE)
+
+**Terminal 1 – Server (with NAT enabled):**
+```bash
+sudo ip netns exec ns-server ./target/debug/server --nat --egress-iface veth-s
+```
+
+**Terminal 2 – Client (with Full Tunnel enabled):**
+```bash
+sudo ip netns exec ns-client ./target/debug/client --server 10.0.2.2:51820 --full-tunnel
+```
+
+**Terminal 3 – Verify Route Overrides:**
+```bash
+sudo ip netns exec ns-client ip route
+```
+Expected output:
+```
+0.0.0.0/1 dev tun0 scope link
+10.0.1.0/24 dev veth-c proto kernel scope link src 10.0.1.2
+10.0.2.2 via 10.0.1.1 dev veth-c
+10.8.0.0/24 dev tun0 proto kernel scope link src 10.8.0.2
+128.0.0.0/1 dev tun0 scope link
+default via 10.0.1.1 dev veth-c
+```
+
+**Terminal 3 – Proof of Victory (Ping outside the tunnel):**
+```bash
+# Ping 10.0.2.1 (the router's interface on the server side)
+sudo ip netns exec ns-client ping -c 4 10.0.2.1
+```
+Expected: **0% packet loss**! Traffic traverses `tun0` $\to$ encrypted UDP $\to$ decrypted on server $\to$ NAT masqueraded $\to$ router replies $\to$ server un-NATs $\to$ encrypted back to client!
+
+### 5. Tear Down
 ```bash
 sudo ./setup-namespaces.sh down
 ```
@@ -156,5 +189,5 @@ sudo ./setup-namespaces.sh down
 - [x] **M2: Plaintext UDP Tunnel** — Bidirectional forwarding across network namespaces.
 - [x] **M3: ChaCha20-Poly1305** — Static key AEAD encryption verified under `tcpdump`.
 - [x] **M4: Noise IK Handshake** — Ephemeral-static ECDH, directional keys, timestamp replay defense, per-session table, post-decrypt sliding window, keepalives.
-- [ ] **M5: Routing & NAT Automation** — Server-side `nftables` MASQUERADE, client default route override.
+- [x] **M5: Routing & NAT Automation** — Server-side `iptables` MASQUERADE, client default route override (`0.0.0.0/1` & `128.0.0.0/1`), RAII cleanup guards.
 - [ ] **M6: Hardening & Cloud Deployment** — Privilege drop to `CAP_NET_ADMIN`, DNS leak prevention, fuzzing, OCI deployment.
