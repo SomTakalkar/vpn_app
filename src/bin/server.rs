@@ -2,9 +2,12 @@
 //!
 //! Features:
 //!   - Ephemeral-static ECDH (Noise IK) key exchange with Perfect Forward Secrecy.
-//!   - Handshake replay protection using monotonic UTC timestamps.
+//!   - Per-peer handshake replay protection using monotonic UTC timestamps.
 //!   - Per-session table keyed by session_id with directional keys (K_c→s and K_s→c).
 //!   - 128-bit AntiReplayFilter checked ONLY AFTER successful Poly1305 decryption.
+//!   - Resilient TUN writes (daemon never panics/aborts on transient write error).
+//!   - Zero-copy IPv4 packet parsing for safe routing.
+//!   - Periodic stale session GC (purges sessions inactive > 1 hour).
 //!   - Support for Data (0x03) and Keepalive (0x04) message types.
 //!
 //! Run inside the server namespace:
@@ -12,12 +15,13 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
+use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -123,6 +127,7 @@ async fn main() -> Result<()> {
     let mut tun_buf = vec![0u8; 65535];
     let mut udp_buf = vec![0u8; 65535];
 
+    let mut sweep_ticker = interval(Duration::from_secs(60));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
@@ -133,6 +138,17 @@ async fn main() -> Result<()> {
             _ = &mut ctrl_c => {
                 info!("Shutting down");
                 break;
+            }
+
+            // ── Stale Session Sweep (Purge inactive > 3600s) ───────
+            _ = sweep_ticker.tick() => {
+                let before = sessions.len();
+                sessions.retain(|_, s| s.last_activity.elapsed() < Duration::from_secs(3600));
+                tun_ip_to_session.retain(|_, id| sessions.contains_key(id));
+                let purged = before - sessions.len();
+                if purged > 0 {
+                    info!("Purged {} stale session(s) inactive > 3600s", purged);
+                }
             }
 
             // ── UDP Ingress: Handshake or Encrypted Packet ─────────
@@ -150,10 +166,7 @@ async fn main() -> Result<()> {
                         &server_static,
                         &udp_buf[..n],
                         |client_pub| authorized_peers.contains_key(client_pub),
-                        authorized_peers
-                            .iter()
-                            .find(|_| true) // demo lookup
-                            .and_then(|(_, cfg)| cfg.last_timestamp),
+                        |client_pub| authorized_peers.get(client_pub).and_then(|cfg| cfg.last_timestamp),
                     );
 
                     match init_res {
@@ -246,8 +259,11 @@ async fn main() -> Result<()> {
                 match hdr.msg_type {
                     MessageType::Data => {
                         if plaintext.len() >= 20 {
-                            tun_dev.write_all(&plaintext).await.context("TUN write failed")?;
-                            debug!("UDP→TUN: {} bytes from session 0x{:08x}", plaintext.len(), header.session_id);
+                            if let Err(e) = tun_dev.write_all(&plaintext).await {
+                                warn!("Failed writing decrypted packet to TUN: {}", e);
+                            } else {
+                                debug!("UDP→TUN: {} bytes from session 0x{:08x}", plaintext.len(), header.session_id);
+                            }
                         }
                     }
                     MessageType::Keepalive => {
@@ -267,7 +283,15 @@ async fn main() -> Result<()> {
                 let n = result.context("TUN read failed")?;
                 if n < 20 { continue; }
 
-                let dst_ip = Ipv4Addr::new(tun_buf[16], tun_buf[17], tun_buf[18], tun_buf[19]);
+                let parsed_header = match vpn::packet::Ipv4PacketHeader::parse(&tun_buf[..n]) {
+                    Some(h) => h,
+                    None => {
+                        debug!("Dropping non-IPv4 or malformed packet from TUN");
+                        continue;
+                    }
+                };
+
+                let dst_ip = parsed_header.dst_ip;
                 let session_id = match tun_ip_to_session.get(&dst_ip) {
                     Some(&id) => id,
                     None => {

@@ -1,92 +1,95 @@
 #!/usr/bin/env bash
-# Simulated network inside one Linux VM:
 #
-#   ns-client  <--veth-->  ns-router ("the internet")  <--veth-->  ns-server
-#   10.0.1.2/24            10.0.1.1 | 10.0.2.1                      10.0.2.2/24
+# setup-namespaces.sh: 3-Node Network Namespace Testbed for VPN Development
+# Architecture:
+#   ns-client (10.0.1.2/24) <---> (10.0.1.1/24) ns-router (10.0.2.1/24) <---> (10.0.2.2/24) ns-server
 #
-# Usage:
-#   sudo ./setup-namespaces.sh up        # create the testbed
-#   sudo ./setup-namespaces.sh status    # show addresses and test connectivity
-#   sudo ./setup-namespaces.sh down      # tear everything down
-#
-# Optional link impairment on the router (applied by `up`):
-#   sudo DELAY=40ms LOSS=2% ./setup-namespaces.sh up
+
 set -euo pipefail
 
-CLIENT=ns-client
-ROUTER=ns-router
-SERVER=ns-server
-DELAY="${DELAY:-}"
-LOSS="${LOSS:-}"
+red()   { echo -e "\033[1;31m$*\033[0m"; }
+green() { echo -e "\033[1;32m$*\033[0m"; }
+bold()  { echo -e "\033[1m$*\033[0m"; }
 
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Please run as root: sudo $0 ${1:-up}" >&2
-    exit 1
-  fi
+if [[ $EUID -ne 0 ]]; then
+   red "This script must be run as root (or with sudo)."
+   exit 1
+fi
+
+setup_testbed() {
+    bold "==> Creating network namespaces..."
+    ip netns add ns-client
+    ip netns add ns-router
+    ip netns add ns-server
+
+    bold "==> Bringing up loopback interfaces..."
+    ip netns exec ns-client ip link set lo up
+    ip netns exec ns-router ip link set lo up
+    ip netns exec ns-server ip link set lo up
+
+    bold "==> Creating veth pairs..."
+    # Client <-> Router link
+    ip link add veth-c type veth peer name veth-rc
+    ip link set veth-c netns ns-client
+    ip link set veth-rc netns ns-router
+
+    # Router <-> Server link
+    ip link add veth-s type veth peer name veth-rs
+    ip link set veth-s netns ns-server
+    ip link set veth-rs netns ns-router
+
+    bold "==> Configuring IP addresses and MTUs..."
+    # ns-client configuration
+    ip netns exec ns-client ip addr add 10.0.1.2/24 dev veth-c
+    ip netns exec ns-client ip link set veth-c mtu 1500 up
+    ip netns exec ns-client ip route add default via 10.0.1.1
+
+    # ns-router configuration
+    ip netns exec ns-router ip addr add 10.0.1.1/24 dev veth-rc
+    ip netns exec ns-router ip link set veth-rc mtu 1500 up
+    ip netns exec ns-router ip addr add 10.0.2.1/24 dev veth-rs
+    ip netns exec ns-router ip link set veth-rs mtu 1500 up
+    ip netns exec ns-router sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    # ns-server configuration
+    ip netns exec ns-server ip addr add 10.0.2.2/24 dev veth-s
+    ip netns exec ns-server ip link set veth-s mtu 1500 up
+    ip netns exec ns-server ip route add default via 10.0.2.1
+    ip netns exec ns-server sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+    green "==> Testbed is UP!"
+    echo "Verifying underlay ping (ns-client -> ns-server 10.0.2.2):"
+    if ip netns exec ns-client ping -c 2 -W 1 10.0.2.2 >/dev/null 2>&1; then
+        green "✓ Underlay transit verified successfully (0% packet loss)."
+    else
+        red "✗ Underlay ping failed. Check sysctl net.ipv4.ip_forward."
+    fi
 }
 
-cleanup() {
-  for ns in "$CLIENT" "$ROUTER" "$SERVER"; do
-    ip netns del "$ns" 2>/dev/null || true
-  done
-  ip link del veth-c 2>/dev/null || true
-  ip link del veth-s 2>/dev/null || true
-}
-
-# connect <ns-a> <dev-a> <addr-a> <ns-b> <dev-b> <addr-b>
-connect() {
-  local ns_a=$1 dev_a=$2 addr_a=$3 ns_b=$4 dev_b=$5 addr_b=$6
-  ip link add "$dev_a" type veth peer name "$dev_b"
-  ip link set "$dev_a" netns "$ns_a"
-  ip link set "$dev_b" netns "$ns_b"
-  ip -n "$ns_a" addr add "$addr_a" dev "$dev_a"
-  ip -n "$ns_b" addr add "$addr_b" dev "$dev_b"
-  ip -n "$ns_a" link set "$dev_a" up
-  ip -n "$ns_b" link set "$dev_b" up
-}
-
-up() {
-  cleanup
-  for ns in "$CLIENT" "$ROUTER" "$SERVER"; do
-    ip netns add "$ns"
-    ip -n "$ns" link set lo up
-  done
-
-  connect "$CLIENT" veth-c  10.0.1.2/24 "$ROUTER" veth-rc 10.0.1.1/24
-  connect "$SERVER" veth-s  10.0.2.2/24 "$ROUTER" veth-rs 10.0.2.1/24
-
-  ip -n "$CLIENT" route add default via 10.0.1.1
-  ip -n "$SERVER" route add default via 10.0.2.1
-  ip netns exec "$ROUTER" sysctl -qw net.ipv4.ip_forward=1
-
-  if [[ -n "$DELAY" || -n "$LOSS" ]]; then
-    local netem=()
-    if [[ -n "$DELAY" ]]; then netem+=(delay "$DELAY"); fi
-    if [[ -n "$LOSS" ]]; then netem+=(loss "$LOSS"); fi
-    for dev in veth-rc veth-rs; do
-      ip netns exec "$ROUTER" tc qdisc add dev "$dev" root netem "${netem[@]}"
-    done
-    echo "Router impairment: ${netem[*]}"
-  fi
-
-  echo "Testbed is up. Try:"
-  echo "  sudo ip netns exec $CLIENT ping -c 2 10.0.2.2"
-}
-
-status() {
-  for ns in "$CLIENT" "$ROUTER" "$SERVER"; do
-    echo "== $ns =="
-    ip -n "$ns" -brief addr
-    ip -n "$ns" route
-  done
-  echo "== client -> server ping =="
-  ip netns exec "$CLIENT" ping -c 1 -W 1 10.0.2.2
+teardown_testbed() {
+    bold "==> Tearing down network namespaces..."
+    ip netns del ns-client 2>/dev/null || true
+    ip netns del ns-router 2>/dev/null || true
+    ip netns del ns-server 2>/dev/null || true
+    ip link del veth-c 2>/dev/null || true
+    ip link del veth-s 2>/dev/null || true
+    green "==> Testbed cleaned up."
 }
 
 case "${1:-}" in
-  up)     require_root "$@"; up ;;
-  down)   require_root "$@"; cleanup; echo "Testbed removed." ;;
-  status) require_root "$@"; status ;;
-  *)      echo "Usage: sudo $0 {up|down|status}" >&2; exit 1 ;;
+    up)
+        teardown_testbed
+        setup_testbed
+        ;;
+    down)
+        teardown_testbed
+        ;;
+    status)
+        echo "Active Network Namespaces:"
+        ip netns list
+        ;;
+    *)
+        echo "Usage: $0 {up|down|status}"
+        exit 1
+        ;;
 esac

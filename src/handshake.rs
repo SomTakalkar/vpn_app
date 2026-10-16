@@ -238,15 +238,16 @@ pub fn process_handshake_resp(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Process Noise IK Message 1 (`HANDSHAKE_INIT`) on the server.
-/// Authenticates client identity, validates timestamp, and generates response.
-pub fn process_handshake_init<F>(
+/// Authenticates client identity, validates timestamp per-peer, and generates response.
+pub fn process_handshake_init<F, T>(
     server_static: &StaticSecret,
     packet: &[u8],
     is_authorized_peer: F,
-    last_timestamp: Option<Timestamp>,
+    get_last_timestamp: T,
 ) -> Result<(SessionKeys, PublicKey, Timestamp, Vec<u8>)>
 where
     F: Fn(&[u8; 32]) -> bool,
+    T: Fn(&[u8; 32]) -> Option<Timestamp>,
 {
     if packet.len() != HANDSHAKE_INIT_LEN {
         bail!("Invalid HandshakeInit length: {} (expected {})", packet.len(), HANDSHAKE_INIT_LEN);
@@ -320,8 +321,8 @@ where
         .map_err(|_| anyhow::anyhow!("Decrypted timestamp invalid length"))?;
     let timestamp = Timestamp::from_bytes(&ts_arr);
 
-    // ── Handshake Replay Check ────────────────────────────────────
-    if let Some(last_ts) = last_timestamp {
+    // ── Handshake Replay Check for THIS peer ─────────────────────
+    if let Some(last_ts) = get_last_timestamp(&client_static_pub_bytes) {
         if !timestamp.is_newer_than(&last_ts) {
             bail!(
                 "Handshake init replay detected! Timestamp {:?} <= last seen {:?}",
@@ -413,7 +414,7 @@ mod tests {
             &server_static,
             &init_packet,
             |pubkey| *pubkey == *client_static_pub.as_bytes(),
-            None,
+            |_| None,
         )
         .unwrap();
 
@@ -450,7 +451,7 @@ mod tests {
             &server_static,
             &init_packet,
             |_| true,
-            None,
+            |_| None,
         )
         .unwrap();
 
@@ -459,7 +460,7 @@ mod tests {
             &server_static,
             &init_packet,
             |_| true,
-            Some(ts1),
+            |_| Some(ts1),
         );
 
         assert!(replay_res.is_err(), "Replayed HandshakeInit must be rejected");
@@ -479,9 +480,10 @@ mod tests {
             &server_static,
             &init_packet,
             |_| false, // reject all clients
-            None,
+            |_| None,
         );
 
         assert!(res.is_err(), "Unauthorized client must be rejected");
     }
 }
+

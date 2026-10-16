@@ -5,6 +5,8 @@
 //!   - Authenticates against pinned server public key.
 //!   - Directional keys (K_c→s for send, K_s→c for receive).
 //!   - 128-bit AntiReplayFilter executed ONLY AFTER successful Poly1305 decryption.
+//!   - Resilient TUN writes (daemon never panics/aborts on transient write error).
+//!   - Non-blocking handshake drain (ignores stray datagrams during response wait).
 //!   - Periodic Keepalive (0x04) heartbeats every 20s to sustain NAT mappings.
 //!   - Rekeying triggers on packet counter or elapsed time.
 //!
@@ -26,7 +28,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use vpn::crypto::{decrypt_packet, encrypt_packet, make_cipher};
 use vpn::handshake::{
     create_handshake_init, process_handshake_resp,
-    DEMO_CLIENT_PRIVATE_KEY, DEMO_SERVER_PRIVATE_KEY,
+    DEMO_CLIENT_PRIVATE_KEY, DEMO_SERVER_PRIVATE_KEY, HANDSHAKE_RESP_LEN,
 };
 use vpn::wire::{
     AntiReplayFilter, MessageType, HEADER_LEN, KEEPALIVE_INTERVAL_SECS,
@@ -237,8 +239,11 @@ async fn main() -> Result<()> {
                 match hdr.msg_type {
                     MessageType::Data => {
                         if plaintext.len() >= 20 {
-                            tun_dev.write_all(&plaintext).await.context("TUN write failed")?;
-                            debug!("UDP→TUN: {} bytes from server (counter={})", plaintext.len(), hdr.counter);
+                            if let Err(e) = tun_dev.write_all(&plaintext).await {
+                                warn!("Failed writing decrypted packet to TUN: {}", e);
+                            } else {
+                                debug!("UDP→TUN: {} bytes from server (counter={})", plaintext.len(), hdr.counter);
+                            }
                         }
                     }
                     MessageType::Keepalive => {
@@ -259,7 +264,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Perform a full Noise IK handshake with retry logic.
+/// Perform a full Noise IK handshake with non-blocking drain for stray datagrams.
 async fn perform_handshake(
     udp: &UdpSocket,
     client_static: &StaticSecret,
@@ -277,36 +282,42 @@ async fn perform_handshake(
         udp.send(&init_pkt).await.context("Failed sending HANDSHAKE_INIT")?;
         debug!("Sent HANDSHAKE_INIT (attempt {}/{})", attempt, max_retries);
 
-        // Wait for HANDSHAKE_RESP with a 2-second timeout
-        let recv_resp = tokio::time::timeout(Duration::from_millis(2000), udp.recv(&mut buf)).await;
+        // Wait up to 2 seconds for a valid HandshakeResp, ignoring stray datagrams
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let mut got_valid_resp = None;
 
-        match recv_resp {
-            Ok(Ok(n)) => {
-                if n > 0 && buf[0] == MessageType::HandshakeResp as u8 {
-                    match process_handshake_resp(state, &buf[..n]) {
-                        Ok(keys) => {
-                            info!(
-                                "Noise IK Handshake SUCCESS! Session ID: 0x{:08x}",
-                                keys.session_id
-                            );
-                            return Ok(ClientSession {
-                                session_id: keys.session_id,
-                                send_cipher: make_cipher(&keys.client_to_server_key),
-                                recv_cipher: make_cipher(&keys.server_to_client_key),
-                                tx_counter: 0,
-                                replay_filter: AntiReplayFilter::new(),
-                                last_sent: Instant::now(),
-                                last_handshake: Instant::now(),
-                            });
-                        }
-                        Err(e) => {
-                            warn!("Failed processing HANDSHAKE_RESP: {}. Retrying...", e);
-                        }
-                    }
+        while Instant::now() < deadline {
+            let time_left = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Ok(n)) = tokio::time::timeout(time_left, udp.recv(&mut buf)).await {
+                if n >= HANDSHAKE_RESP_LEN && buf[0] == MessageType::HandshakeResp as u8 {
+                    got_valid_resp = Some(buf[..n].to_vec());
+                    break;
+                }
+            } else {
+                break; // Timeout elapsed
+            }
+        }
+
+        if let Some(resp_bytes) = got_valid_resp {
+            match process_handshake_resp(state, &resp_bytes) {
+                Ok(keys) => {
+                    info!("Noise IK Handshake SUCCESS! Session ID: 0x{:08x}", keys.session_id);
+                    return Ok(ClientSession {
+                        session_id: keys.session_id,
+                        send_cipher: make_cipher(&keys.client_to_server_key),
+                        recv_cipher: make_cipher(&keys.server_to_client_key),
+                        tx_counter: 0,
+                        replay_filter: AntiReplayFilter::new(),
+                        last_sent: Instant::now(),
+                        last_handshake: Instant::now(),
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed processing HANDSHAKE_RESP: {}. Retrying...", e);
                 }
             }
-            Ok(Err(e)) => warn!("UDP receive error during handshake: {}", e),
-            Err(_) => debug!("Handshake timeout (attempt {}). Retrying...", attempt),
+        } else {
+            debug!("Handshake timeout on attempt {}. Retrying...", attempt);
         }
     }
 
