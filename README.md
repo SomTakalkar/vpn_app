@@ -2,7 +2,7 @@
 
 A custom, memory-safe, high-performance Layer 3/4 encrypted VPN daemon written in Rust for Linux.
 
-Instead of relying on OpenVPN or WireGuard, this project intercepts raw IP packets via a virtual network interface (`/dev/net/tun`), encrypts them using **ChaCha20-Poly1305 AEAD**, and tunnels them over **UDP** with authenticated **ECDH key exchange** and **anti-replay sliding window filters**.
+Instead of relying on OpenVPN or WireGuard, this project intercepts raw IP packets via a virtual network interface (`/dev/net/tun`), encrypts them using **ChaCha20-Poly1305 AEAD**, and tunnels them over **UDP** with authenticated **ECDH key exchange (Noise IK)**, **directional keys**, **handshake timestamp replay protection**, and **anti-replay sliding window filters**.
 
 ---
 
@@ -11,7 +11,10 @@ Instead of relying on OpenVPN or WireGuard, this project intercepts raw IP packe
 ```
 [ Client Traffic ] ---> (TUN Device: tun0) ---> [ Client Daemon ]
                                                        |
-                                          (ChaCha20-Poly1305 Encrypted UDP)
+                                          (Noise IK Authenticated UDP)
+                                          - Directional Keys (K_c→s, K_s→c)
+                                          - 128-bit Post-Decrypt Replay Filter
+                                          - Periodic Keepalives (0x04)
                                                        v
 [ Internet / Target ] <--- (NAT / Forwarding) <--- [ Server Daemon ]
 ```
@@ -19,29 +22,33 @@ Instead of relying on OpenVPN or WireGuard, this project intercepts raw IP packe
 ### Key Components
 - **TUN Device Interception**: Direct async read/write of raw IP packets from `/dev/net/tun`.
 - **Wire Protocol**: Custom UDP framing `[Type: 1B][Session ID: 4B][Counter: 8B][Ciphertext + 16B Tag]`.
-- **Cryptography**: Modern AEAD (`ChaCha20-Poly1305`) with 96-bit nonces derived from a monotonically increasing 64-bit counter. Wire header bytes serve as Authenticated Associated Data (AAD).
-- **Anti-Replay Protection**: 128-bit sliding window bitmap dropping duplicate and out-of-order stale packets.
-- **NAT & Subnet Forwarding** *(Phase 5)*: Server-side `nftables` masquerade and automated client routing table override.
+- **Authenticated Handshake (Noise IK)**: Ephemeral-Static Curve25519 Diffie-Hellman (`x25519-dalek`) with mutual authentication and Perfect Forward Secrecy.
+- **Handshake Replay Protection**: WireGuard-style encrypted monotonic UTC timestamps; server drops any `HANDSHAKE_INIT` with a timestamp $\le$ last seen for that peer.
+- **Directional Nonce Collision Immunity**: Distinct $K_{c \to s}$ and $K_{s \to c}$ derived via `HKDF-SHA256`; prevents nonce collisions and reflection attacks.
+- **Post-Decryption Replay Filter**: 128-bit sliding window bitmap; executes **only after** Poly1305 authentication succeeds to prevent unauthenticated window manipulation.
+- **NAT Keepalives**: Periodic `0x04` heartbeats sent every 20s during idle periods to sustain NAT state.
+- **NAT & Subnet Forwarding** *(Phase 5)*: Server-side `nftables` masquerade and client routing table override.
 
 ---
 
 ## 📦 Project Structure
 
 ```
-├── Cargo.toml                  # Dependencies (tokio, tun 0.6, chacha20poly1305, x25519-dalek, etc.)
+├── Cargo.toml                  # Dependencies (tokio, tun 0.6, chacha20poly1305, x25519-dalek, hkdf, rand)
 ├── setup-namespaces.sh         # 3-node network namespace testbed (ns-client ↔ ns-router ↔ ns-server)
 ├── README.md
 ├── .gitignore
 └── src/
-    ├── lib.rs                  # Library root (exports crypto, packet, wire modules)
+    ├── lib.rs                  # Library root (exports crypto, handshake, packet, wire)
     ├── main.rs                 # Unified CLI entry point
-    ├── crypto.rs               # ChaCha20-Poly1305 encrypt/decrypt with AAD and nonce construction
+    ├── crypto.rs               # ChaCha20-Poly1305 AEAD with nonce construction & AAD framing
+    ├── handshake.rs            # Noise IK handshake, timestamp replay defense & key derivation
     ├── packet.rs               # Zero-copy IPv4 packet header parser
-    ├── wire.rs                 # Wire protocol framing and 128-bit sliding window replay filter
+    ├── wire.rs                 # Wire protocol definitions & 128-bit anti-replay filter
     └── bin/
         ├── tun_playground.rs   # Phase 1: standalone TUN packet sniffer with unit tests
-        ├── client.rs           # VPN client daemon (TUN → encrypted UDP → server)
-        └── server.rs           # VPN server daemon (encrypted UDP → TUN, peer table, NAT-ready)
+        ├── client.rs           # Phase 4 client: handshake, directional encryption, keepalives
+        └── server.rs           # Phase 4 server: handshake auth, session table, anti-replay
 ```
 
 ---
@@ -55,12 +62,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 ```
 
-### Clone & Build
+### Clone, Build & Test
 ```bash
 git clone https://github.com/SomTakalkar/vpn_app.git
 cd vpn_app
-cargo build
 cargo test --all-targets
+cargo build
 ```
 
 ---
@@ -82,66 +89,64 @@ sudo ./setup-namespaces.sh up
 sudo ip netns exec ns-client ping -c 2 10.0.2.2
 ```
 
-### 2. Phase 1 — TUN Playground (Packet Sniffing)
-**Terminal 1:**
-```bash
-sudo ip netns exec ns-client ./target/debug/tun_playground
-```
-**Terminal 2:**
-```bash
-sudo ip netns exec ns-client ping -c 3 10.8.0.3
-```
-Observe the daemon intercepting and parsing raw IPv4/ICMP headers in real time.
-
-### 3. Phase 2 & 3 — Encrypted UDP Tunnel (End-to-End Ping)
+### 2. Phase 4 — Authenticated Noise IK VPN
 **Terminal 1 – Server:**
 ```bash
 sudo ip netns exec ns-server ./target/debug/server
 ```
+
 **Terminal 2 – Client:**
 ```bash
 sudo ip netns exec ns-client ./target/debug/client --server 10.0.2.2:51820
 ```
+
+Notice the logs in Terminal 1 and 2:
+```
+INFO client: Initiating Noise IK Handshake with server...
+INFO server: Noise IK Handshake complete! Session ID: 0x... for peer 10.0.1.2:... (tunnel IP: 10.8.0.2)
+INFO client: Noise IK Handshake SUCCESS! Session ID: 0x...
+INFO client: Client tunnel established – forwarding encrypted packets
+```
+
 **Terminal 3 – Ping through the tunnel:**
 ```bash
 sudo ip netns exec ns-client ping -c 3 10.8.0.1
 ```
-Expected: **0% packet loss**, ~1 ms RTT.
+Expected: **0% packet loss**, authenticated bidirectional encrypted transit!
 
-### 4. Verify Encryption with tcpdump
-While the tunnel is active, inspect the wire in a **fourth terminal**:
+### 3. Verify Wire Secrecy with tcpdump
+**Terminal 4:**
 ```bash
-sudo ip netns exec ns-router tcpdump -i veth-rc -X udp port 51820 -c 5
+sudo ip netns exec ns-router tcpdump -i veth-rc -X udp port 51820 -c 10
 ```
-All UDP payloads should be **opaque ciphertext** — no recognisable IP headers (`0x45`), ICMP types, or patterns.
+- Handshake init (`0x01`): Ephemeral key + ciphertext.
+- Handshake response (`0x02`): Ephemeral key + session ID + auth tag.
+- Data (`0x03`): Completely encrypted with directional keys; headers authenticated as AAD.
+- Keepalive (`0x04`): Emitted every 20s if no ping traffic is flowing.
 
-### 5. Tear Down
+### 4. Tear Down
 ```bash
 sudo ./setup-namespaces.sh down
 ```
 
 ---
 
-## 🔐 Wire Protocol
+## 🔐 Wire Protocol Details
 
-### Data Packet Format (`0x03`)
-```
-[Type: 1 byte][Session ID: 4 bytes LE][Counter: 8 bytes LE][Encrypted Payload][Poly1305 Tag: 16 bytes]
- ← ─ ─ ─ ─ ─ ─ ─ Header (13 bytes, used as AAD) ─ ─ ─ → ← ─ ─ ─ ChaCha20-Poly1305 AEAD ─ ─ ─ →
-```
-
-- **Nonce**: `[0x00 × 4 || Counter as 8-byte LE]` → 96-bit, unique per packet.
-- **AAD**: The 13-byte header is authenticated but not encrypted, allowing the receiver to parse the counter before decryption.
-- **Tamper detection**: Any modification to the header, ciphertext, or tag causes decryption to fail immediately.
-
-### Message Types
+### Packet Headers & Types
 | Byte | Type | Description |
 |------|------|-------------|
-| `0x01` | `HANDSHAKE_INIT` | Client → Server ECDH initiation |
-| `0x02` | `HANDSHAKE_RESP` | Server → Client ECDH response |
-| `0x03` | `DATA` | Encrypted tunnel payload |
-| `0x04` | `KEEPALIVE` | NAT binding heartbeat |
-| `0x05` | `REKEY` | Session key rotation trigger |
+| `0x01` | `HANDSHAKE_INIT` | Noise IK Message 1 (Ephemeral pubkey + encrypted static identity + timestamp) |
+| `0x02` | `HANDSHAKE_RESP` | Noise IK Message 2 (Ephemeral pubkey + session ID + authentication tag) |
+| `0x03` | `DATA` | Encrypted IP packet payload |
+| `0x04` | `KEEPALIVE` | Authenticated empty frame to maintain stateful NAT bindings |
+| `0x05` | `REKEY` | Rekey trigger before counter exhaustion ($2^{64}-2^{16}$) |
+
+### Data Wire Frame (`0x03` & `0x04`)
+```
+[Type: 1B][Session ID: 4B LE][Counter: 8B LE][Encrypted Payload][Poly1305 Tag: 16B]
+ ← ─ ─ ─ ─ ─ ─ ─ Header (13 bytes, AAD) ─ ─ ─ ─ ─ ─ ─ → ← ─ ─ ChaCha20-Poly1305 ─ ─ ─ →
+```
 
 ---
 
@@ -149,7 +154,7 @@ sudo ./setup-namespaces.sh down
 
 - [x] **M1: TUN Playground** — Async TUN creation, IP assignment, raw packet parsing.
 - [x] **M2: Plaintext UDP Tunnel** — Bidirectional forwarding across network namespaces.
-- [x] **M3: ChaCha20-Poly1305** — AEAD encryption verified opaque under `tcpdump`.
-- [ ] **M4: Noise IK Handshake** — Authenticated ephemeral-static ECDH, replay window, keepalives, rekeying.
+- [x] **M3: ChaCha20-Poly1305** — Static key AEAD encryption verified under `tcpdump`.
+- [x] **M4: Noise IK Handshake** — Ephemeral-static ECDH, directional keys, timestamp replay defense, per-session table, post-decrypt sliding window, keepalives.
 - [ ] **M5: Routing & NAT Automation** — Server-side `nftables` MASQUERADE, client default route override.
-- [ ] **M6: Hardening & Deployment** — Privilege drop to `CAP_NET_ADMIN`, DNS leak prevention, fuzzing, OCI cloud deployment.
+- [ ] **M6: Hardening & Cloud Deployment** — Privilege drop to `CAP_NET_ADMIN`, DNS leak prevention, fuzzing, OCI deployment.

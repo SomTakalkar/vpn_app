@@ -1,25 +1,55 @@
-//! Phase 3 – VPN Server: ChaCha20-Poly1305 encrypted UDP tunnel
+//! Phase 4 – VPN Server: Authenticated Noise IK Handshake + Anti-Replay + Session Table
 //!
-//! Identical to the Phase 2 server, but every UDP datagram is now
-//! authenticated and encrypted with a pre-shared ChaCha20-Poly1305 key.
+//! Features:
+//!   - Ephemeral-static ECDH (Noise IK) key exchange with Perfect Forward Secrecy.
+//!   - Handshake replay protection using monotonic UTC timestamps.
+//!   - Per-session table keyed by session_id with directional keys (K_c→s and K_s→c).
+//!   - 128-bit AntiReplayFilter checked ONLY AFTER successful Poly1305 decryption.
+//!   - Support for Data (0x03) and Keepalive (0x04) message types.
 //!
 //! Run inside the server namespace:
 //!   sudo ip netns exec ns-server ./target/debug/server
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
+use x25519_dalek::{PublicKey, StaticSecret};
 
-use vpn::crypto::{decrypt_packet, encrypt_packet, make_cipher, PRESHARED_KEY};
+use vpn::crypto::{decrypt_packet, encrypt_packet, make_cipher};
+use vpn::handshake::{
+    process_handshake_init, Timestamp, DEMO_CLIENT_PRIVATE_KEY, DEMO_SERVER_PRIVATE_KEY,
+};
+use vpn::wire::{
+    AntiReplayFilter, DataHeader, MessageType, HEADER_LEN, REJECT_AFTER_MESSAGES,
+};
+
+struct PeerConfig {
+    allowed_ip: Ipv4Addr,
+    last_timestamp: Option<Timestamp>,
+}
+
+struct ActiveSession {
+    session_id: u32,
+    peer_pub: [u8; 32],
+    peer_tun_ip: Ipv4Addr,
+    peer_udp_addr: SocketAddr,
+    send_cipher: chacha20poly1305::ChaCha20Poly1305, // K_s→c
+    recv_cipher: chacha20poly1305::ChaCha20Poly1305, // K_c→s
+    tx_counter: u64,
+    replay_filter: AntiReplayFilter,
+    created_at: Instant,
+    last_activity: Instant,
+}
 
 #[derive(Parser, Debug)]
-#[command(about = "Phase 3: VPN server – encrypted UDP tunnel")]
+#[command(about = "Phase 4: VPN Server with Noise IK Handshake & Anti-Replay")]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:51820")]
     bind: String,
@@ -45,9 +75,24 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // ── Cipher (Phase 3: pre-shared key; replaced by ECDH in Phase 4) ─
-    let cipher = make_cipher(&PRESHARED_KEY);
-    info!("ChaCha20-Poly1305 cipher initialised (pre-shared key)");
+    // ── Static Keys ────────────────────────────────────────────────
+    let server_static = StaticSecret::from(DEMO_SERVER_PRIVATE_KEY);
+    let server_public = PublicKey::from(&server_static);
+    info!("Server Static Public Key: {:02x?}", &server_public.as_bytes()[..8]);
+
+    // ── Authorized Peers ───────────────────────────────────────────
+    let client_static = StaticSecret::from(DEMO_CLIENT_PRIVATE_KEY);
+    let client_public = PublicKey::from(&client_static);
+
+    let mut authorized_peers: HashMap<[u8; 32], PeerConfig> = HashMap::new();
+    authorized_peers.insert(
+        *client_public.as_bytes(),
+        PeerConfig {
+            allowed_ip: Ipv4Addr::new(10, 8, 0, 2),
+            last_timestamp: None,
+        },
+    );
+    info!("Loaded {} authorized peer(s)", authorized_peers.len());
 
     // ── Create TUN device ──────────────────────────────────────────
     let mut tun_config = tun::Configuration::default();
@@ -63,7 +108,6 @@ async fn main() -> Result<()> {
 
     let mut tun_dev = tun::create_as_async(&tun_config)
         .context("Failed to create TUN device (need root / CAP_NET_ADMIN)")?;
-
     info!("TUN '{}' is up: {}/{} mtu={}", args.tun_name, args.tun_addr, args.netmask, args.mtu);
 
     // ── Bind UDP socket ────────────────────────────────────────────
@@ -72,9 +116,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to bind UDP on {}", args.bind))?;
     info!("Listening on UDP {}", args.bind);
 
-    // ── Peer table: tunnel IPv4 → last-known UDP SocketAddr ───────
-    let mut peers: HashMap<Ipv4Addr, SocketAddr> = HashMap::new();
-    let mut tx_counter: u64 = 0;
+    // ── Session Tables ─────────────────────────────────────────────
+    let mut sessions: HashMap<u32, ActiveSession> = HashMap::new();
+    let mut tun_ip_to_session: HashMap<Ipv4Addr, u32> = HashMap::new();
 
     let mut tun_buf = vec![0u8; 65535];
     let mut udp_buf = vec![0u8; 65535];
@@ -82,7 +126,7 @@ async fn main() -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
-    info!("Server ready – waiting for encrypted client packets");
+    info!("Server ready – waiting for handshakes and tunnel traffic");
 
     loop {
         tokio::select! {
@@ -91,61 +135,180 @@ async fn main() -> Result<()> {
                 break;
             }
 
-            // ── UDP → TUN ─────────────────────────────────────────
+            // ── UDP Ingress: Handshake or Encrypted Packet ─────────
             result = udp.recv_from(&mut udp_buf) => {
                 let (n, peer_addr) = result.context("UDP recv_from failed")?;
+                if n == 0 { continue; }
 
-                // Decrypt & authenticate
-                let (header, plaintext) = match decrypt_packet(&cipher, &udp_buf[..n]) {
-                    Ok(v) => v,
+                let msg_type = udp_buf[0];
+
+                // ── 1. Handshake Initiation (0x01) ─────────────────
+                if msg_type == MessageType::HandshakeInit as u8 {
+                    debug!("Received HANDSHAKE_INIT from {}", peer_addr);
+
+                    let init_res = process_handshake_init(
+                        &server_static,
+                        &udp_buf[..n],
+                        |client_pub| authorized_peers.contains_key(client_pub),
+                        authorized_peers
+                            .iter()
+                            .find(|_| true) // demo lookup
+                            .and_then(|(_, cfg)| cfg.last_timestamp),
+                    );
+
+                    match init_res {
+                        Ok((session_keys, client_pub, timestamp, resp_packet)) => {
+                            let client_pub_bytes = *client_pub.as_bytes();
+                            let peer_cfg = authorized_peers.get_mut(&client_pub_bytes).unwrap();
+                            peer_cfg.last_timestamp = Some(timestamp);
+                            let assigned_ip = peer_cfg.allowed_ip;
+
+                            // Create fresh session with directional keys
+                            let session_id = session_keys.session_id;
+                            let session = ActiveSession {
+                                session_id,
+                                peer_pub: client_pub_bytes,
+                                peer_tun_ip: assigned_ip,
+                                peer_udp_addr: peer_addr,
+                                send_cipher: make_cipher(&session_keys.server_to_client_key),
+                                recv_cipher: make_cipher(&session_keys.client_to_server_key),
+                                tx_counter: 0,
+                                replay_filter: AntiReplayFilter::new(),
+                                created_at: Instant::now(),
+                                last_activity: Instant::now(),
+                            };
+
+                            sessions.insert(session_id, session);
+                            tun_ip_to_session.insert(assigned_ip, session_id);
+
+                            info!(
+                                "Noise IK Handshake complete! Session ID: 0x{:08x} for peer {} (tunnel IP: {})",
+                                session_id, peer_addr, assigned_ip
+                            );
+
+                            // Send HandshakeResp back to client
+                            if let Err(e) = udp.send_to(&resp_packet, peer_addr).await {
+                                warn!("Failed to send HANDSHAKE_RESP to {}: {}", peer_addr, e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Handshake rejected from {}: {}", peer_addr, e);
+                        }
+                    }
+                    continue;
+                }
+
+                // ── 2. Data (0x03) or Keepalive (0x04) ────────────
+                if n < HEADER_LEN {
+                    warn!("Dropping undersized packet ({} bytes) from {}", n, peer_addr);
+                    continue;
+                }
+
+                let header = match DataHeader::deserialize(&udp_buf[..HEADER_LEN]) {
+                    Ok(h) => h,
                     Err(e) => {
-                        warn!("Rejected datagram from {}: {}", peer_addr, e);
+                        warn!("Bad header from {}: {}", peer_addr, e);
                         continue;
                     }
                 };
 
-                if plaintext.is_empty() {
-                    debug!("Keepalive from {}", peer_addr);
+                // Fast session lookup
+                let session = match sessions.get_mut(&header.session_id) {
+                    Some(s) => s,
+                    None => {
+                        warn!("Unknown session ID 0x{:08x} from {}", header.session_id, peer_addr);
+                        continue;
+                    }
+                };
+
+                // CRITICAL STEP 1: Decrypt FIRST before touching replay filter
+                let (hdr, plaintext) = match decrypt_packet(&session.recv_cipher, &udp_buf[..n]) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        warn!("Decryption failed for session 0x{:08x}: {}", header.session_id, e);
+                        continue;
+                    }
+                };
+
+                // CRITICAL STEP 2: Check & update AntiReplayFilter ONLY on authenticated packet
+                if !session.replay_filter.check_and_update(hdr.counter) {
+                    warn!(
+                        "Replay filter dropped duplicate/stale packet: session 0x{:08x}, counter {}",
+                        header.session_id, hdr.counter
+                    );
                     continue;
                 }
 
-                // Register peer by inner source IP
-                if plaintext.len() >= 20 && (plaintext[0] >> 4) == 4 {
-                    let src_ip = Ipv4Addr::new(
-                        plaintext[12], plaintext[13], plaintext[14], plaintext[15],
-                    );
-                    if peers.get(&src_ip) != Some(&peer_addr) {
-                        info!("Peer registered: tunnel {} → UDP {} (session {})",
-                            src_ip, peer_addr, header.session_id);
-                        peers.insert(src_ip, peer_addr);
+                // Roaming support: update peer UDP endpoint and activity timestamp
+                session.peer_udp_addr = peer_addr;
+                session.last_activity = Instant::now();
+
+                match hdr.msg_type {
+                    MessageType::Data => {
+                        if plaintext.len() >= 20 {
+                            tun_dev.write_all(&plaintext).await.context("TUN write failed")?;
+                            debug!("UDP→TUN: {} bytes from session 0x{:08x}", plaintext.len(), header.session_id);
+                        }
+                    }
+                    MessageType::Keepalive => {
+                        debug!("Keepalive received for session 0x{:08x} from {}", header.session_id, peer_addr);
+                    }
+                    MessageType::Rekey => {
+                        info!("Rekey request from session 0x{:08x}", header.session_id);
+                    }
+                    _ => {
+                        debug!("Unhandled message type {:?}", hdr.msg_type);
                     }
                 }
-
-                tun_dev.write_all(&plaintext).await.context("TUN write failed")?;
-                debug!("UDP→TUN: {} plaintext bytes from {} (counter={})",
-                    plaintext.len(), peer_addr, header.counter);
             }
 
-            // ── TUN → UDP ─────────────────────────────────────────
+            // ── TUN Ingress: Route Outgoing Packet to Session ─────
             result = tun_dev.read(&mut tun_buf) => {
                 let n = result.context("TUN read failed")?;
                 if n < 20 { continue; }
 
                 let dst_ip = Ipv4Addr::new(tun_buf[16], tun_buf[17], tun_buf[18], tun_buf[19]);
-                let peer_addr = match peers.get(&dst_ip) {
-                    Some(a) => *a,
+                let session_id = match tun_ip_to_session.get(&dst_ip) {
+                    Some(&id) => id,
                     None => {
-                        debug!("No peer for destination {}, dropping", dst_ip);
+                        debug!("No active session for destination IP {}, dropping", dst_ip);
                         continue;
                     }
                 };
 
-                tx_counter += 1;
-                let datagram = encrypt_packet(&cipher, 0, tx_counter, &tun_buf[..n])
-                    .context("Encryption failed")?;
+                let session = match sessions.get_mut(&session_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
 
-                udp.send_to(&datagram, peer_addr).await.context("UDP send_to failed")?;
-                debug!("TUN→UDP: {} bytes → {} (counter={})", n, peer_addr, tx_counter);
+                // Guard counter wrapping
+                if session.tx_counter >= REJECT_AFTER_MESSAGES {
+                    error!("Session 0x{:08x} tx_counter exhausted! Dropping packet.", session_id);
+                    continue;
+                }
+
+                session.tx_counter += 1;
+                let counter = session.tx_counter;
+
+                let datagram = match encrypt_packet(
+                    &session.send_cipher,
+                    MessageType::Data,
+                    session.session_id,
+                    counter,
+                    &tun_buf[..n],
+                ) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Encryption failed: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Err(e) = udp.send_to(&datagram, session.peer_udp_addr).await {
+                    warn!("Failed sending to peer {}: {}", session.peer_udp_addr, e);
+                } else {
+                    debug!("TUN→UDP: {} bytes → {} (counter={})", n, session.peer_udp_addr, counter);
+                }
             }
         }
     }

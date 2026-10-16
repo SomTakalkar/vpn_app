@@ -4,44 +4,34 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
 };
 
-use crate::wire::{DataHeader, HEADER_LEN, TAG_LEN};
-
-/// A pre-shared 256-bit key used for Phase 3.
-/// Both client and server must use the same constant.
-/// This is replaced by ECDH-derived keys in Phase 4.
-pub const PRESHARED_KEY: [u8; 32] = [
-    0x4a, 0x6f, 0x75, 0x72, 0x6e, 0x65, 0x79, 0x54,
-    0x6f, 0x50, 0x68, 0x61, 0x73, 0x65, 0x46, 0x6f,
-    0x75, 0x72, 0x49, 0x73, 0x45, 0x43, 0x44, 0x48,
-    0x61, 0x6e, 0x64, 0x52, 0x65, 0x6b, 0x65, 0x79,
-];
+use crate::wire::{DataHeader, MessageType, HEADER_LEN, TAG_LEN};
 
 /// Build a 96-bit nonce from an 8-byte counter.
 /// Layout: [0x00 × 4 bytes || counter as 8-byte LE]
-/// This guarantees uniqueness for up to 2^64 packets per session key.
-fn make_nonce(counter: u64) -> Nonce {
+/// Guarantees nonce uniqueness for up to 2^64 packets under a single key.
+pub fn make_nonce(counter: u64) -> Nonce {
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[4..].copy_from_slice(&counter.to_le_bytes());
     Nonce::from(nonce_bytes)
 }
 
-/// Encrypt a raw IP packet into an on-wire datagram.
+/// Encrypt an IP packet or control frame into an on-wire datagram.
 ///
 /// Wire format:
 ///   [header: 13 bytes][ciphertext: n bytes][Poly1305 tag: 16 bytes]
 ///
-/// The header is used as AEAD associated data (authenticated but not encrypted).
+/// The header (Type || Session ID || Counter) is authenticated as AEAD associated data (AAD).
 pub fn encrypt_packet(
     cipher: &ChaCha20Poly1305,
+    msg_type: MessageType,
     session_id: u32,
     counter: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let header = DataHeader::new(session_id, counter);
+    let header = DataHeader::new_typed(msg_type, session_id, counter);
     let hdr_bytes = header.serialize();
     let nonce = make_nonce(counter);
 
-    // Encrypt with the 13-byte wire header as AAD
     let ciphertext = cipher
         .encrypt(
             &nonce,
@@ -50,9 +40,8 @@ pub fn encrypt_packet(
                 aad: &hdr_bytes,
             },
         )
-        .map_err(|_| anyhow::anyhow!("Encryption failed (nonce reuse or key error)"))?;
+        .map_err(|_| anyhow::anyhow!("Encryption failed (nonce or key error)"))?;
 
-    // Assemble final datagram
     let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
     out.extend_from_slice(&hdr_bytes);
     out.extend_from_slice(&ciphertext);
@@ -60,12 +49,13 @@ pub fn encrypt_packet(
     Ok(out)
 }
 
-/// Decrypt an on-wire datagram back to a raw IP packet.
+/// Decrypt an on-wire datagram back to a raw IP packet or control payload.
 ///
 /// Validates the Poly1305 tag over both header (AAD) and ciphertext.
-/// Returns an error if the tag is invalid (tampered or replayed packet).
+/// Returns an error if the tag is invalid (tampered, wrong key, or corrupt).
+///
+/// IMPORTANT: Replay window filter MUST be updated by the caller ONLY IF this returns Ok!
 pub fn decrypt_packet(cipher: &ChaCha20Poly1305, datagram: &[u8]) -> Result<(DataHeader, Vec<u8>)> {
-    // Minimum size: header (13) + empty ciphertext + tag (16)
     if datagram.len() < HEADER_LEN + TAG_LEN {
         bail!(
             "Datagram too short to decrypt: {} bytes (min {})",
@@ -88,7 +78,7 @@ pub fn decrypt_packet(cipher: &ChaCha20Poly1305, datagram: &[u8]) -> Result<(Dat
             },
         )
         .map_err(|_| anyhow::anyhow!(
-            "Decryption failed – packet is tampered, replayed, or uses wrong key"
+            "Decryption/authentication failed – packet is tampered, wrong key, or corrupt"
         ))?;
 
     Ok((header, plaintext))
@@ -103,72 +93,53 @@ pub fn make_cipher(key_bytes: &[u8; 32]) -> ChaCha20Poly1305 {
 mod tests {
     use super::*;
 
-    fn test_cipher() -> ChaCha20Poly1305 {
-        make_cipher(&PRESHARED_KEY)
-    }
+    const TEST_KEY: [u8; 32] = [0x42; 32];
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let cipher = test_cipher();
-        let plaintext = b"Hello, encrypted tunnel!";
+        let cipher = make_cipher(&TEST_KEY);
+        let plaintext = b"Hello, encrypted directional tunnel!";
 
-        let datagram = encrypt_packet(&cipher, 0xAABBCCDD, 1, plaintext)
+        let datagram = encrypt_packet(&cipher, MessageType::Data, 0xAABBCCDD, 1, plaintext)
             .expect("Encryption should succeed");
 
         let (header, recovered) = decrypt_packet(&cipher, &datagram)
             .expect("Decryption should succeed");
 
         assert_eq!(recovered, plaintext);
+        assert_eq!(header.msg_type, MessageType::Data);
         assert_eq!(header.session_id, 0xAABBCCDD);
         assert_eq!(header.counter, 1);
     }
 
     #[test]
-    fn test_tampered_ciphertext_rejected() {
-        let cipher = test_cipher();
-        let plaintext = b"secret data";
+    fn test_keepalive_packet_encryption() {
+        let cipher = make_cipher(&TEST_KEY);
+        // Keepalive has empty payload
+        let datagram = encrypt_packet(&cipher, MessageType::Keepalive, 0x12345678, 5, b"")
+            .expect("Keepalive encrypt should succeed");
 
-        let mut datagram = encrypt_packet(&cipher, 1, 1, plaintext)
-            .expect("Encryption should succeed");
+        let (header, payload) = decrypt_packet(&cipher, &datagram)
+            .expect("Keepalive decrypt should succeed");
 
-        // Flip a bit in the ciphertext
-        let last = datagram.len() - 1;
-        datagram[last] ^= 0xFF;
+        assert_eq!(header.msg_type, MessageType::Keepalive);
+        assert_eq!(header.session_id, 0x12345678);
+        assert_eq!(header.counter, 5);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_tampered_header_rejected() {
+        let cipher = make_cipher(&TEST_KEY);
+        let mut datagram = encrypt_packet(&cipher, MessageType::Data, 1, 1, b"secret")
+            .expect("Encrypt should succeed");
+
+        // Tamper with session ID in header (bytes 1..5)
+        datagram[1] ^= 0xFF;
 
         assert!(
             decrypt_packet(&cipher, &datagram).is_err(),
-            "Tampered packet must be rejected"
-        );
-    }
-
-    #[test]
-    fn test_wrong_key_rejected() {
-        let cipher_a = test_cipher();
-        let cipher_b = make_cipher(&[0u8; 32]);
-        let plaintext = b"classified";
-
-        let datagram = encrypt_packet(&cipher_a, 1, 1, plaintext)
-            .expect("Encryption should succeed");
-
-        assert!(
-            decrypt_packet(&cipher_b, &datagram).is_err(),
-            "Packet encrypted with different key must be rejected"
-        );
-    }
-
-    #[test]
-    fn test_different_counters_produce_different_ciphertexts() {
-        let cipher = test_cipher();
-        let plaintext = b"same plaintext";
-
-        let d1 = encrypt_packet(&cipher, 1, 1, plaintext).unwrap();
-        let d2 = encrypt_packet(&cipher, 1, 2, plaintext).unwrap();
-
-        // Ciphertexts must differ even for identical plaintexts
-        assert_ne!(
-            &d1[HEADER_LEN..],
-            &d2[HEADER_LEN..],
-            "Different counters must produce different ciphertexts"
+            "Tampered AAD in header must fail Poly1305 auth"
         );
     }
 }

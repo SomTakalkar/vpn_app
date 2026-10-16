@@ -1,13 +1,15 @@
 use anyhow::{bail, Result};
 
-#[allow(dead_code)]
 pub const HEADER_LEN: usize = 13; // 1 (type) + 4 (session_id) + 8 (counter)
-#[allow(dead_code)]
 pub const TAG_LEN: usize = 16;    // Poly1305 MAC tag
-#[allow(dead_code)]
 pub const OVERHEAD: usize = HEADER_LEN + TAG_LEN; // 29 bytes
 
-#[allow(dead_code)]
+// Rekeying and counter limits
+pub const REKEY_AFTER_MESSAGES: u64 = 1 << 32;          // Rekey after 4 billion packets
+pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 16); // Hard limit: halt before 64-bit wrap
+pub const REKEY_AFTER_TIME_SECS: u64 = 1800;             // Rekey after 30 minutes
+pub const KEEPALIVE_INTERVAL_SECS: u64 = 20;            // Send keepalive every 20s of inactivity
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -33,8 +35,7 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
-/// Header for encapsulated data datagrams.
-#[allow(dead_code)]
+/// Header for encapsulated data, keepalive, and rekey datagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataHeader {
     pub msg_type: MessageType,
@@ -42,11 +43,20 @@ pub struct DataHeader {
     pub counter: u64,
 }
 
-#[allow(dead_code)]
 impl DataHeader {
+    /// Create a standard data message header.
     pub fn new(session_id: u32, counter: u64) -> Self {
         Self {
             msg_type: MessageType::Data,
+            session_id,
+            counter,
+        }
+    }
+
+    /// Create a header with explicit message type (Data, Keepalive, or Rekey).
+    pub fn new_typed(msg_type: MessageType, session_id: u32, counter: u64) -> Self {
+        Self {
+            msg_type,
             session_id,
             counter,
         }
@@ -80,14 +90,15 @@ impl DataHeader {
 }
 
 /// 128-bit Anti-Replay Sliding Window.
-#[allow(dead_code)]
-#[derive(Debug, Default)]
+///
+/// MUST be called only AFTER successful packet decryption to prevent
+/// unauthenticated packets from moving the window.
+#[derive(Debug, Default, Clone)]
 pub struct AntiReplayFilter {
     max_counter: u64,
     bitmap: u128,
 }
 
-#[allow(dead_code)]
 impl AntiReplayFilter {
     pub const WINDOW_SIZE: u64 = 128;
 
@@ -140,7 +151,7 @@ mod tests {
 
     #[test]
     fn test_data_header_roundtrip() {
-        let original = DataHeader::new(0xDEADBEEF, 42);
+        let original = DataHeader::new_typed(MessageType::Keepalive, 0xDEADBEEF, 42);
         let bytes = original.serialize();
         let parsed = DataHeader::deserialize(&bytes).expect("Should deserialize");
         assert_eq!(original, parsed);
