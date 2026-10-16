@@ -25,7 +25,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use vpn::crypto::{decrypt_packet, encrypt_packet, make_cipher};
 use vpn::handshake::{
-    create_handshake_init, process_handshake_resp, SessionKeys,
+    create_handshake_init, process_handshake_resp,
     DEMO_CLIENT_PRIVATE_KEY, DEMO_SERVER_PRIVATE_KEY,
 };
 use vpn::wire::{
